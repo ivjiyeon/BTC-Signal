@@ -94,7 +94,7 @@ def calculate_indicators(df):
 
     # Bollinger Bands (20-period)
     df['BB_Upper'] = ta.volatility.bollinger_hband(df['close'], window=20)
-    df['BB_Middle'] = ta.volatility.bollinger_mband(df['close'], window=20)
+    df['BB_Middle'] = ta.trend.sma_indicator(df['close'], window=20)
     df['BB_Lower'] = ta.volatility.bollinger_lband(df['close'], window=20)
 
     # VWAP (using a rolling window, as session-based is complex for historical data)
