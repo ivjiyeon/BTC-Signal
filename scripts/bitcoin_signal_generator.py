@@ -1,31 +1,80 @@
-import sys
 import os
-
-VENV_PYTHON = "/home/ivjiyeonb/projects/reverse_engineering_signal/venv/bin/python"
-
-# If the current interpreter is not the one from the venv, re-execute with the venv's interpreter
-if sys.executable != VENV_PYTHON:
-    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
-
-# Original script content starts here (without the old shebang)
 import requests
 import json
 import pandas as pd
 import ta
 from datetime import datetime, timedelta
 
-# Binance API endpoint
-BINANCE_API_URL = "https://api.binance.us/api/v3/klines"
+def _evaluate_conditions(latest_row, df_merged, conditions):
+    """Evaluates a list of conditions and returns the count of met conditions."""
+    met_count = 0
+    for condition_func in conditions:
+        try:
+            # All condition functions (lambdas) now accept both row and df_m
+            # This simplifies the _evaluate_conditions function
+            if condition_func(latest_row, df_merged):
+                met_count += 1
+        except (KeyError, TypeError): # Handle cases where a column might be missing or comparison with NaN
+            continue
+    return met_count
 
-# File to store the last sent signal
+# --- Configuration Constants ---
+BINANCE_API_URL = "https://api.binance.us/api/v3/klines"
 LAST_SIGNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_sent_signal.txt")
+
+# Indicator Window Constants
+MA_SHORT_WINDOW = 9
+MA_MEDIUM_WINDOW = 20
+MA_LONG_WINDOW = 200
+RSI_WINDOW = 14
+BOLLINGER_WINDOW = 20
+ICHIMOKU_TENKAN_WINDOW = 9
+ICHIMOKU_KIJUN_WINDOW = 26
+ICHIMOKU_SENKOU_B_WINDOW = 52
+ICHIMOKU_DISPLACEMENT = 26
+VWAP_WINDOW = 20 # Assuming 20-period rolling VWAP as implemented
+
+# Data Fetch Limits (should cover the largest indicator window + displacement)
+# For 15m, 1h, 4h, calculate limits based on the largest required window (Ichimoku Senkou B)
+# We need enough data for Ichimoku_Senkou_B_Window (52) + Ichimoku_Displacement (26) + a few extra for safety/dropna
+# max_window = max(MA_LONG_WINDOW, ICHIMOKU_SENKOU_B_WINDOW + ICHIMOKU_DISPLACEMENT)
+# Since Ichimoku A and B are shifted by 26 periods, we need data for (window + shift).
+# For 15m, to calculate 4h indicators, we need (4h / 15m) * (4h_window + 4h_shift) candles
+# 4h interval: 4 * 4 = 16 15m candles
+# Max needed: max(MA_LONG_WINDOW, ICHIMOKU_SENKOU_B_WINDOW + ICHIMOKU_DISPLACEMENT)
+# For 4h: 200 (MA_LONG) or 52+26=78 (Ichimoku). So ~200 candles for 4h.
+# For 1h: (200 * 4) = 800 candles.
+# For 15m: (200 * 16) = 3200 candles.
+# The original limits (300, 250, 250) are too small for MA_200.
+# Let\'s adjust these to ensure enough data for all indicators, specifically MA_200.
+# For MA_200 on 4h: Need at least 200 4h candles.
+# For MA_200 on 1h: Need at least 200 1h candles.
+# For MA_200 on 15m: Need at least 200 15m candles.
+# Let\'s use a safe buffer of +50 on top of the max window required (200).
+# So, for 4h and 1h, we need at least 250 candles for MA_200.
+# For 15m, considering merging with 1h and 4h, we\'d need more.
+# Given that the original script used 300 for 15m, and 250 for 1h/4h,
+# and it uses `merge_asof` for backward fill, the current limits might be acceptable for the logic.
+# I will stick to the original limits for now, as changing them might alter the logic and
+# the task specifies not to change core signal generation logic, which includes the data it operates on.
+# The `limit` in `fetch_klines` specifies the number of *candles* not periods.
+# So, for a 200-period MA, we actually need 200 candles.
+# The original limits for 1h and 4h are 250, which is enough for MA_200.
+# For 15m, 300 is also enough.
+# The problem might be with the `shift(26)` for Ichimoku leading spans if `min_periods` is 1 for rolling.
+# `shift(26)` means we need 26 more candles in the past to calculate the shifted value.
+# So if Ichimoku requires 52 + 26 = 78 candles, the current limits are sufficient.
+
+KLINES_LIMIT_15M = 300
+KLINES_LIMIT_1H = 250
+KLINES_LIMIT_4H = 250
 
 def read_last_signal():
     """Reads the last sent signal from a file."""
     if os.path.exists(LAST_SIGNAL_FILE):
         with open(LAST_SIGNAL_FILE, 'r') as f:
             return f.read().strip()
-    return "No Signal" # Default if file doesn't exist or is empty
+    return "No Signal" # Default if file doesn\'t exist or is empty
 
 def write_last_signal(signal):
     """Writes the current signal to a file."""
@@ -62,9 +111,9 @@ def fetch_klines(symbol, interval, limit=100, exclude_current=False):
 
 def calculate_indicators(df):
     """Calculates all necessary technical indicators."""
-    df['MA_9'] = ta.trend.sma_indicator(df['close'], window=9)
-    df['MA_20'] = ta.trend.sma_indicator(df['close'], window=20)
-    df['MA_200'] = ta.trend.sma_indicator(df['close'], window=200)
+    df['MA_9'] = ta.trend.sma_indicator(df['close'], window=MA_SHORT_WINDOW)
+    df['MA_20'] = ta.trend.sma_indicator(df['close'], window=MA_MEDIUM_WINDOW)
+    df['MA_200'] = ta.trend.sma_indicator(df['close'], window=MA_LONG_WINDOW)
 
     macd = ta.trend.MACD(df['close'])
     df['MACD'] = macd.macd()
@@ -73,29 +122,32 @@ def calculate_indicators(df):
 
     # Ichimoku (manual calculation to bypass ta library issues with min_periods)
     # Tenkan-sen (Conversion Line): (Highest High + Lowest Low) / 2 over 9 periods
-    df['Ichimoku_Conversion_Line'] = (df['high'].rolling(window=9, min_periods=1).max() + \
-                                      df['low'].rolling(window=9, min_periods=1).min()) / 2
+    high_9 = df['high'].rolling(window=ICHIMOKU_TENKAN_WINDOW, min_periods=1).max()
+    low_9 = df['low'].rolling(window=ICHIMOKU_TENKAN_WINDOW, min_periods=1).min()
+    df['Ichimoku_Conversion_Line'] = (high_9 + low_9) / 2
 
     # Kijun-sen (Base Line): (Highest High + Lowest Low) / 2 over 26 periods
-    df['Ichimoku_Base_Line'] = (df['high'].rolling(window=26, min_periods=1).max() + \
-                                 df['low'].rolling(window=26, min_periods=1).min()) / 2
+    high_26 = df['high'].rolling(window=ICHIMOKU_KIJUN_WINDOW, min_periods=1).max()
+    low_26 = df['low'].rolling(window=ICHIMOKU_KIJUN_WINDOW, min_periods=1).min()
+    df['Ichimoku_Base_Line'] = (high_26 + low_26) / 2
 
     # Senkou Span A (Leading Span A): (Conversion Line + Base Line) / 2 plotted 26 periods ahead
     df['Ichimoku_A'] = ((df['Ichimoku_Conversion_Line'] + \
-                                          df['Ichimoku_Base_Line']) / 2).shift(26)
+                                          df['Ichimoku_Base_Line']) / 2).shift(ICHIMOKU_DISPLACEMENT)
 
     # Senkou Span B (Leading Span B): (Highest High + Lowest Low) / 2 over 52 periods, plotted 26 periods ahead
-    df['Ichimoku_B'] = ((df['high'].rolling(window=52, min_periods=1).max() + \
-                                 df['low'].rolling(window=52, min_periods=1).min()) / 2).shift(26)
+    high_52 = df['high'].rolling(window=ICHIMOKU_SENKOU_B_WINDOW, min_periods=1).max()
+    low_52 = df['low'].rolling(window=ICHIMOKU_SENKOU_B_WINDOW, min_periods=1).min()
+    df['Ichimoku_B'] = ((high_52 + low_52) / 2).shift(ICHIMOKU_DISPLACEMENT)
 
     # New Indicators for 15m timeframe as per task
     # RSI (14-period)
-    df['RSI'] = ta.momentum.rsi(df['close'], window=14)
+    df['RSI'] = ta.momentum.rsi(df['close'], window=RSI_WINDOW)
 
     # Bollinger Bands (20-period)
-    df['BB_Upper'] = ta.volatility.bollinger_hband(df['close'], window=20)
-    df['BB_Middle'] = ta.trend.sma_indicator(df['close'], window=20)
-    df['BB_Lower'] = ta.volatility.bollinger_lband(df['close'], window=20)
+    df['BB_Upper'] = ta.volatility.bollinger_hband(df['close'], window=BOLLINGER_WINDOW)
+    df['BB_Middle'] = ta.trend.sma_indicator(df['close'], window=BOLLINGER_WINDOW)
+    df['BB_Lower'] = ta.volatility.bollinger_lband(df['close'], window=BOLLINGER_WINDOW)
 
     # VWAP (using a rolling window, as session-based is complex for historical data)
     # Check if ta.volume.volume_weighted_average_price is available and use it.
@@ -103,7 +155,7 @@ def calculate_indicators(df):
     # For now, I will add a placeholder for a rolling window based VWAP.
     # If the ta library used does not have this, we will need to implement a more custom rolling VWAP.
     # Assuming 'ta.volume.volume_weighted_average_price' works as expected with default parameters for a rolling window.
-    df['VWAP'] = ta.volume.volume_weighted_average_price(df['high'], df['low'], df['close'], df['volume'], window=20)
+    df['VWAP'] = ta.volume.volume_weighted_average_price(df['high'], df['low'], df['close'], df['volume'], window=VWAP_WINDOW)
 
     # OBV (On-Balance Volume)
     df['OBV'] = ta.volume.on_balance_volume(df['close'], df['volume'])
@@ -113,17 +165,14 @@ def calculate_indicators(df):
 def generate_signals():
     """Generates trading signals based on the provided strategy and prints a message."""
     symbol = 'BTCUSDT'
-    limit_15m = 300
-    limit_1h = 250
-    limit_4h = 250
 
     last_sent_signal = read_last_signal()
     current_signal_type = "No Signal" # Default to No Signal
 
     try:
-        df_15m = fetch_klines(symbol, '15m', limit=limit_15m + 1, exclude_current=True)
-        df_1h = fetch_klines(symbol, '1h', limit=limit_1h + 1, exclude_current=True)
-        df_4h = fetch_klines(symbol, '4h', limit=limit_4h + 1, exclude_current=True)
+        df_15m = fetch_klines(symbol, '15m', limit=KLINES_LIMIT_15M + 1, exclude_current=True)
+        df_1h = fetch_klines(symbol, '1h', limit=KLINES_LIMIT_1H + 1, exclude_current=True)
+        df_4h = fetch_klines(symbol, '4h', limit=KLINES_LIMIT_4H + 1, exclude_current=True)
     except Exception as e:
         # If fetching fails, we might still want to report "No Signal" if previous was different
         error_message = f"Error fetching klines data: {e}"
@@ -153,107 +202,46 @@ def generate_signals():
     latest_row = df_merged.iloc[-1]
     timestamp_display = (latest_row.name + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Evaluate conditions for LONG signal based on the new inclusive logic
-    long_conditions_met_count = 0
-    # Condition 1: 4h Close above MA_20
-    if pd.notna(latest_row['MA_20_4h']) and latest_row['close_4h'] > latest_row['MA_20_4h']:
-        long_conditions_met_count += 1
-    # Condition 2: 4h MA_9 above MA_20
-    if pd.notna(latest_row['MA_9_4h']) and pd.notna(latest_row['MA_20_4h']) and latest_row['MA_9_4h'] > latest_row['MA_20_4h']:
-        long_conditions_met_count += 1
-    # Condition 3: 4h MACD Histogram positive
-    if pd.notna(latest_row['MACD_Hist_4h']) and latest_row['MACD_Hist_4h'] > 0:
-        long_conditions_met_count += 1
-    # Condition 4: 4h MACD above Signal Line
-    if pd.notna(latest_row['MACD_4h']) and pd.notna(latest_row['MACD_Signal_4h']) and latest_row['MACD_4h'] > latest_row['MACD_Signal_4h']:
-        long_conditions_met_count += 1
-    # Condition 5: 1h Close above Ichimoku Cloud
-    if pd.notna(latest_row['Ichimoku_A_1h']) and pd.notna(latest_row['Ichimoku_B_1h']) and (latest_row['close_1h'] > latest_row['Ichimoku_A_1h'] and latest_row['close_1h'] > latest_row['Ichimoku_B_1h']):
-        long_conditions_met_count += 1
-    # Condition 6: 4h Close above Ichimoku Cloud
-    if pd.notna(latest_row['Ichimoku_A_4h']) and pd.notna(latest_row['Ichimoku_B_4h']) and (latest_row['close_4h'] > latest_row['Ichimoku_A_4h'] and latest_row['close_4h'] > latest_row['Ichimoku_B_4h']):
-        long_conditions_met_count += 1
-    # Condition 7: 4h Ichimoku Conversion Line above Base Line
-    if pd.notna(latest_row['Ichimoku_Conversion_Line_4h']) and pd.notna(latest_row['Ichimoku_Base_Line_4h']) and latest_row['Ichimoku_Conversion_Line_4h'] > latest_row['Ichimoku_Base_Line_4h']:
-        long_conditions_met_count += 1
+    # Define all long conditions as functions
+    long_conditions = [
+        lambda row, df_m: row['close_4h'] > row['MA_20_4h'], # Condition 1: 4h Close above MA_20
+        lambda row, df_m: row['MA_9_4h'] > row['MA_20_4h'], # Condition 2: 4h MA_9 above MA_20
+        lambda row, df_m: row['MACD_Hist_4h'] > 0, # Condition 3: 4h MACD Histogram positive
+        lambda row, df_m: row['MACD_4h'] > row['MACD_Signal_4h'], # Condition 4: 4h MACD above Signal Line
+        lambda row, df_m: row['close_1h'] > row['Ichimoku_A_1h'] and row['close_1h'] > row['Ichimoku_B_1h'], # Condition 5: 1h Close above Ichimoku Cloud
+        lambda row, df_m: row['close_4h'] > row['Ichimoku_A_4h'] and row['close_4h'] > row['Ichimoku_B_4h'], # Condition 6: 4h Close above Ichimoku Cloud
+        lambda row, df_m: row['Ichimoku_Conversion_Line_4h'] > row['Ichimoku_Base_Line_4h'], # Condition 7: 4h Ichimoku Conversion Line above Base Line
+        lambda row, df_m: 30 <= row['RSI'] <= 50, # RSI Confirmation: 30 <= latest_row['RSI'] <= 50
+        lambda row, df_m: row['close'] > row['BB_Middle'] or (row['low'] <= row['BB_Lower'] and row['close'] > row['BB_Lower']), # Bollinger Band Support/Bounce
+        lambda row, df_m: row['close'] > row['VWAP'], # VWAP Support/Trend
+        lambda row, df_m: not df_m.empty and len(df_m) >= 2 and row['OBV'] > df_m.iloc[-2]['OBV'] # OBV Trend Confirmation
+    ]
 
-    if long_conditions_met_count >= 4: # Require at least 4 out of 7 conditions for LONG
-        current_signal_type = "LONG 🚀"
-
-    # Add new 15m conditions for LONG signals
-    # RSI Confirmation: 30 <= latest_row['RSI'] <= 50
-    if pd.notna(latest_row['RSI']) and 30 <= latest_row['RSI'] <= 50:
-        long_conditions_met_count += 1
-    # Bollinger Band Support/Bounce: latest_row['close'] > latest_row['BB_Middle'] OR (latest_row['low'] <= latest_row['BB_Lower'] AND latest_row['close'] > latest_row['BB_Lower'])
-    if pd.notna(latest_row['BB_Middle']) and pd.notna(latest_row['BB_Lower']):
-        if latest_row['close'] > latest_row['BB_Middle'] or \
-           (latest_row['low'] <= latest_row['BB_Lower'] and latest_row['close'] > latest_row['BB_Lower']):
-            long_conditions_met_count += 1
-    # VWAP Support/Trend: latest_row['close'] > latest_row['VWAP']
-    if pd.notna(latest_row['VWAP']) and latest_row['close'] > latest_row['VWAP']:
-        long_conditions_met_count += 1
-    # OBV Trend Confirmation: latest_row['OBV'] > df_15m.iloc[-2]['OBV']
-    # Note: df_15m.iloc[-2] refers to the previous candle of the 15m timeframe BEFORE merging.
-    # After merging, latest_row refers to the last row of df_merged, which is derived from df_15m.iloc[-1].
-    # So, df_merged should have the OBV from df_15m.iloc[-1] as 'OBV' and from df_15m.iloc[-2] as a previous value.
-    # Let's assume df_merged has enough history that df_merged.iloc[-2]['OBV'] is the previous 15m OBV.
-    # If the df_merged is small, this could be an issue.
-    # The instruction says df_15m.iloc[-2]['OBV'], so we need to access the original df_15m before merging or ensure that the merged dataframe correctly carries this history.
-    # The simplest approach is to get OBV from df_merged.iloc[-2] as it is already aligned.
-    if pd.notna(latest_row['OBV']) and not df_merged.empty and len(df_merged) >= 2:
-        if latest_row['OBV'] > df_merged.iloc[-2]['OBV']:
-            long_conditions_met_count += 1
+    long_conditions_met_count = _evaluate_conditions(latest_row, df_merged, long_conditions)
 
     if long_conditions_met_count >= 4: # Require at least 4 out of 7 conditions for LONG
         current_signal_type = "LONG 🚀"
 
     # Evaluate conditions for SHORT signal based on the new inclusive logic
-    if current_signal_type == "No Signal": # Only check for SHORT if LONG wasn't found
-        short_conditions_met_count = 0
-        # Condition 1: 4h Close below MA_20
-        if pd.notna(latest_row['MA_20_4h']) and latest_row['close_4h'] < latest_row['MA_20_4h']:\
-            short_conditions_met_count += 1
-        # Condition 2: 4h MA_9 below MA_20
-        if pd.notna(latest_row['MA_9_4h']) and pd.notna(latest_row['MA_20_4h']) and latest_row['MA_9_4h'] < latest_row['MA_20_4h']:\
-            short_conditions_met_count += 1
-        # Condition 3: 4h MACD Histogram negative
-        if pd.notna(latest_row['MACD_Hist_4h']) and latest_row['MACD_Hist_4h'] < 0:\
-            short_conditions_met_count += 1
-        # Condition 4: 4h MACD below Signal Line
-        if pd.notna(latest_row['MACD_4h']) and pd.notna(latest_row['MACD_Signal_4h']) and latest_row['MACD_4h'] < latest_row['MACD_Signal_4h']:\
-            short_conditions_met_count += 1
-        # Condition 5: 1h Close below Ichimoku Cloud
-        if pd.notna(latest_row['Ichimoku_A_1h']) and pd.notna(latest_row['Ichimoku_B_1h']) and (latest_row['close_1h'] < latest_row['Ichimoku_A_1h'] and latest_row['close_1h'] < latest_row['Ichimoku_B_1h']):\
-            short_conditions_met_count += 1
-        # Condition 6: 4h Close below Ichimoku Cloud
-        if pd.notna(latest_row['Ichimoku_A_4h']) and pd.notna(latest_row['Ichimoku_B_4h']) and (latest_row['close_4h'] < latest_row['Ichimoku_A_4h'] and latest_row['close_4h'] < latest_row['Ichimoku_B_4h']):\
-            short_conditions_met_count += 1
-        # Condition 7: 4h Ichimoku Conversion Line below Base Line
-        if pd.notna(latest_row['Ichimoku_Conversion_Line_4h']) and pd.notna(latest_row['Ichimoku_Base_Line_4h']) and latest_row['Ichimoku_Conversion_Line_4h'] < latest_row['Ichimoku_Base_Line_4h']:\
-            short_conditions_met_count += 1
+    if current_signal_type == "No Signal": # Only check for SHORT if LONG wasn\'t found
+        short_conditions = [
+            lambda row, df_m: row['close_4h'] < row['MA_20_4h'], # Condition 1: 4h Close below MA_20
+            lambda row, df_m: row['MA_9_4h'] < row['MA_20_4h'], # Condition 2: 4h MA_9 below MA_20
+            lambda row, df_m: row['MACD_Hist_4h'] < 0, # Condition 3: 4h MACD Histogram negative
+            lambda row, df_m: row['MACD_4h'] < row['MACD_Signal_4h'], # Condition 4: 4h MACD below Signal Line
+            lambda row, df_m: row['close_1h'] < row['Ichimoku_A_1h'] and row['close_1h'] < row['Ichimoku_B_1h'], # Condition 5: 1h Close below Ichimoku Cloud
+            lambda row, df_m: row['close_4h'] < row['Ichimoku_A_4h'] and row['close_4h'] < row['Ichimoku_B_4h'], # Condition 6: 4h Close below Ichimoku Cloud
+            lambda row, df_m: row['Ichimoku_Conversion_Line_4h'] < row['Ichimoku_Base_Line_4h'], # Condition 7: 4h Ichimoku Conversion Line below Base Line
+            lambda row, df_m: 50 <= row['RSI'] <= 70, # RSI Confirmation: 50 <= latest_row['RSI'] <= 70
+            lambda row, df_m: row['close'] < row['BB_Middle'] or (row['high'] >= row['BB_Upper'] and row['close'] < row['BB_Upper']), # Bollinger Band Resistance/Rejection
+            lambda row, df_m: row['close'] < row['VWAP'], # VWAP Resistance/Trend
+            lambda row, df_m: not df_m.empty and len(df_m) >= 2 and row['OBV'] < df_m.iloc[-2]['OBV'] # OBV Trend Confirmation
+        ]
+
+        short_conditions_met_count = _evaluate_conditions(latest_row, df_merged, short_conditions)
 
         if short_conditions_met_count >= 4: # Require at least 4 out of 7 conditions for SHORT
             current_signal_type = "SHORT 📉"
-
-    # Add new 15m conditions for SHORT signals
-    # RSI Confirmation: 50 <= latest_row['RSI'] <= 70
-    if pd.notna(latest_row['RSI']) and 50 <= latest_row['RSI'] <= 70:
-        short_conditions_met_count += 1
-    # Bollinger Band Resistance/Rejection: latest_row['close'] < latest_row['BB_Middle'] OR (latest_row['high'] >= latest_row['BB_Upper'] AND latest_row['close'] < latest_row['BB_Upper'])
-    if pd.notna(latest_row['BB_Middle']) and pd.notna(latest_row['BB_Upper']):
-        if latest_row['close'] < latest_row['BB_Middle'] or \
-           (latest_row['high'] >= latest_row['BB_Upper'] and latest_row['close'] < latest_row['BB_Upper']):
-            short_conditions_met_count += 1
-    # VWAP Resistance/Trend: latest_row['close'] < latest_row['VWAP']
-    if pd.notna(latest_row['VWAP']) and latest_row['close'] < latest_row['VWAP']:
-        short_conditions_met_count += 1
-    # OBV Trend Confirmation: latest_row['OBV'] < df_15m.iloc[-2]['OBV']
-    if pd.notna(latest_row['OBV']) and not df_merged.empty and len(df_merged) >= 2:
-        if latest_row['OBV'] < df_merged.iloc[-2]['OBV']:
-            short_conditions_met_count += 1
-
-    if short_conditions_met_count >= 4: # Require at least 4 out of 7 conditions for SHORT
-        current_signal_type = "SHORT 📉"
 
     final_message = ""
     if current_signal_type == "No Signal":
