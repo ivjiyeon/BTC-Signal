@@ -1,0 +1,8 @@
+[2026-05-12T06:02:30.395060] Warning: hermes_tools.default_api not found. Messages will not be sent to Telegram.
+[2026-05-12T06:02:30.395398] Starting send_signals_to_telegram execution.
+[2026-05-12T06:02:30.437648] Error executing signal_generator.py: Command '['python3', '/home/ivjiyeonb/projects/reverse_engineering_signal/scripts/signal_generator.py']' returned non-zero exit status 1.
+[2026-05-12T06:02:30.437786] Stderr: Traceback (most recent call last):
+  File "/home/ivjiyeonb/projects/reverse_engineering_signal/scripts/signal_generator.py", line 2, in <module>
+    import pandas as pd
+ModuleNotFoundError: No module named 'pandas'
+
