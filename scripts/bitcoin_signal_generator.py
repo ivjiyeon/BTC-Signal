@@ -1,3 +1,11 @@
+import sys
+import os
+
+VENV_PYTHON = "/home/ivjiyeonb/projects/reverse_engineering_signal/venv/bin/python"
+
+if sys.executable != VENV_PYTHON:
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
 import os
 import requests
 import json
